@@ -145,6 +145,7 @@ import com.starrocks.load.loadv2.LoadJobScheduler;
 import com.starrocks.load.loadv2.LoadLoadingChecker;
 import com.starrocks.load.loadv2.LoadMgr;
 import com.starrocks.load.loadv2.LoadTimeoutChecker;
+import com.starrocks.load.loadv2.LoadsHistorySyncer;
 import com.starrocks.load.pipe.PipeListener;
 import com.starrocks.load.pipe.PipeManager;
 import com.starrocks.load.pipe.PipeScheduler;
@@ -382,6 +383,7 @@ public class GlobalStateMgr {
     private final LoadJobScheduler loadJobScheduler;
 
     private final LoadTimeoutChecker loadTimeoutChecker;
+    private final LoadsHistorySyncer loadsHistorySyncer;
     private final LoadEtlChecker loadEtlChecker;
     private final LoadLoadingChecker loadLoadingChecker;
     private final LockChecker lockChecker;
@@ -496,9 +498,8 @@ public class GlobalStateMgr {
         return journalObservable;
     }
 
-    public TNodesInfo createNodesInfo(long warehouseId) {
+    public TNodesInfo createNodesInfo(long warehouseId, SystemInfoService systemInfoService) {
         TNodesInfo nodesInfo = new TNodesInfo();
-        SystemInfoService systemInfoService = nodeMgr.getClusterInfo();
         if (RunMode.isSharedDataMode()) {
             List<Long> computeNodeIds = warehouseMgr.getAllComputeNodeIds(warehouseId);
             for (Long cnId : computeNodeIds) {
@@ -675,6 +676,7 @@ public class GlobalStateMgr {
         this.loadJobScheduler = new LoadJobScheduler();
         this.loadMgr = new LoadMgr(loadJobScheduler);
         this.loadTimeoutChecker = new LoadTimeoutChecker(loadMgr);
+        this.loadsHistorySyncer = new LoadsHistorySyncer();
         this.loadEtlChecker = new LoadEtlChecker(loadMgr);
         this.loadLoadingChecker = new LoadLoadingChecker(loadMgr);
         this.lockChecker = new LockChecker();
@@ -1305,6 +1307,7 @@ public class GlobalStateMgr {
         loadMgr.prepareJobs();
         loadJobScheduler.start();
         loadTimeoutChecker.start();
+        loadsHistorySyncer.start();
         loadEtlChecker.start();
         loadLoadingChecker.start();
         // Export checker

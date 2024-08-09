@@ -2193,6 +2193,11 @@ public class SchemaChangeHandler extends AlterHandler {
             if (bucketSize == olapTable.getAutomaticBucketSize()) {
                 return;
             }
+        } else if (metaType == TTabletMetaType.MUTABLE_BUCKET_NUM) {
+            long mutableBucketNum = Long.parseLong(properties.get(PropertyAnalyzer.PROPERTIES_MUTABLE_BUCKET_NUM));
+            if (mutableBucketNum == olapTable.getMutableBucketNum()) {
+                return;
+            }
         } else if (metaType == TTabletMetaType.PRIMARY_INDEX_CACHE_EXPIRE_SEC) {
             int primaryIndexCacheExpireSec = Integer.parseInt(properties.get(
                     PropertyAnalyzer.PROPERTIES_PRIMARY_INDEX_CACHE_EXPIRE_SEC));
@@ -2775,6 +2780,7 @@ public class SchemaChangeHandler extends AlterHandler {
 
             // for now table's state can only be NORMAL
             Preconditions.checkState(olapTable.getState() == OlapTableState.NORMAL, olapTable.getState().name());
+            olapTable.setState(OlapTableState.UPDATING_META);
             SchemaChangeJobV2 schemaChangeJob = new SchemaChangeJobV2(jobId, db.getId(), olapTable.getId(),
                     olapTable.getName(), 1000);
             // update base index schema
@@ -2845,6 +2851,7 @@ public class SchemaChangeHandler extends AlterHandler {
             LOG.info("finished modify table's add or drop column(field). table: {}, is replay: {}", olapTable.getName(),
                     isReplay);
         } finally {
+            olapTable.setState(OlapTableState.NORMAL);
             locker.unLockTablesWithIntensiveDbLock(db, Lists.newArrayList(olapTable.getId()), LockType.WRITE);
         }
     }

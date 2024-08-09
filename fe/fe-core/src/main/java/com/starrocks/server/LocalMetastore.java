@@ -48,6 +48,7 @@ import com.staros.proto.FilePathInfo;
 import com.starrocks.alter.AlterJobExecutor;
 import com.starrocks.alter.AlterMVJobExecutor;
 import com.starrocks.alter.AlterOpType;
+import com.starrocks.alter.MaterializedViewHandler;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.HintNode;
@@ -71,6 +72,7 @@ import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.HashDistributionInfo;
 import com.starrocks.catalog.HiveTable;
 import com.starrocks.catalog.Index;
+import com.starrocks.catalog.KeysType;
 import com.starrocks.catalog.ListPartitionInfo;
 import com.starrocks.catalog.LocalTablet;
 import com.starrocks.catalog.MaterializedIndex;
@@ -1592,11 +1594,9 @@ public class LocalMetastore implements ConnectorMetadata, MVRepairHandler {
         }
 
         Long id = GlobalStateMgr.getCurrentState().getNextId();
-        long shardGroupId = 0;
-        if (olapTable.isCloudNativeTableOrMaterializedView()) {
-            shardGroupId = GlobalStateMgr.getCurrentState().getStarOSAgent().
-                    createShardGroup(db.getId(), olapTable.getId(), id);
-        }
+        // physical partitions in the same logical partition use the same shard_group_id,
+        // so that the shards of this logical partition are more evenly distributed.
+        long shardGroupId = partition.getShardGroupId();
 
         if (name == null) {
             name = partition.generatePhysicalPartitionName(id);
@@ -1636,10 +1636,15 @@ public class LocalMetastore implements ConnectorMetadata, MVRepairHandler {
 
     public void addSubPartitions(Database db, OlapTable table, Partition partition,
                                  int numSubPartition, long warehouseId) throws DdlException {
-        addSubPartitions(db, table, partition, numSubPartition, null, warehouseId);
+        try {
+            table.setAutomaticBucketing(true);
+            addSubPartitions(db, table, partition, numSubPartition, null, warehouseId);
+        } finally {
+            table.setAutomaticBucketing(false);
+        }
     }
 
-    public void addSubPartitions(Database db, OlapTable table, Partition partition,
+    private void addSubPartitions(Database db, OlapTable table, Partition partition,
                                  int numSubPartition, String[] subPartitionNames, long warehouseId) throws DdlException {
         OlapTable olapTable;
         OlapTable copiedTable;
@@ -1684,7 +1689,10 @@ public class LocalMetastore implements ConnectorMetadata, MVRepairHandler {
             for (PhysicalPartition subPartition : subPartitions) {
                 // add sub partition
                 partition.addSubPartition(subPartition);
+                olapTable.addPhysicalPartition(subPartition);
             }
+
+            olapTable.setShardGroupChanged(true);
 
             // add partition log
             addSubPartitionLog(db, olapTable, partition, subPartitions);
@@ -1702,6 +1710,7 @@ public class LocalMetastore implements ConnectorMetadata, MVRepairHandler {
             Partition partition = olapTable.getPartition(info.getPartitionId());
             PhysicalPartition physicalPartition = info.getPhysicalPartition();
             partition.addSubPartition(physicalPartition);
+            olapTable.addPhysicalPartition(physicalPartition);
 
             if (!isCheckpointThread()) {
                 // add to inverted index
@@ -1818,14 +1827,19 @@ public class LocalMetastore implements ConnectorMetadata, MVRepairHandler {
             numReplicas += partition.storageReplicaCount();
         }
 
-        if (numReplicas > Config.create_table_max_serial_replicas) {
-            LOG.info("start to build {} partitions concurrently for table {}.{} with {} replicas",
-                    partitions.size(), db.getFullName(), table.getName(), numReplicas);
-            buildPartitionsConcurrently(db.getId(), table, partitions, numReplicas, numAliveNodes, warehouseId);
-        } else {
-            LOG.info("start to build {} partitions sequentially for table {}.{} with {} replicas",
-                    partitions.size(), db.getFullName(), table.getName(), numReplicas);
-            buildPartitionsSequentially(db.getId(), table, partitions, numReplicas, numAliveNodes, warehouseId);
+        try {
+            GlobalStateMgr.getCurrentState().getConsistencyChecker().addCreatingTableId(table.getId());
+            if (numReplicas > Config.create_table_max_serial_replicas) {
+                LOG.info("start to build {} partitions concurrently for table {}.{} with {} replicas",
+                        partitions.size(), db.getFullName(), table.getName(), numReplicas);
+                buildPartitionsConcurrently(db.getId(), table, partitions, numReplicas, numAliveNodes, warehouseId);
+            } else {
+                LOG.info("start to build {} partitions sequentially for table {}.{} with {} replicas",
+                        partitions.size(), db.getFullName(), table.getName(), numReplicas);
+                buildPartitionsSequentially(db.getId(), table, partitions, numReplicas, numAliveNodes, warehouseId);
+            }
+        } finally {
+            GlobalStateMgr.getCurrentState().getConsistencyChecker().deleteCreatingTableId(table.getId());
         }
     }
 
@@ -3056,7 +3070,54 @@ public class LocalMetastore implements ConnectorMetadata, MVRepairHandler {
     @Override
     public void createMaterializedView(CreateMaterializedViewStmt stmt)
             throws AnalysisException, DdlException {
-        stateMgr.getAlterJobMgr().processCreateSynchronousMaterializedView(stmt);
+        MaterializedViewHandler materializedViewHandler =
+                GlobalStateMgr.getCurrentState().getAlterJobMgr().getMaterializedViewHandler();
+        String tableName = stmt.getBaseIndexName();
+        // check db
+        String dbName = stmt.getDBName();
+        Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
+        if (db == null) {
+            ErrorReport.reportDdlException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
+        }
+        // check cluster capacity
+        GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().checkClusterCapacity();
+        // check db quota
+        db.checkQuota();
+
+        Locker locker = new Locker();
+        if (!locker.lockDatabaseAndCheckExist(db, LockType.WRITE)) {
+            throw new DdlException("create materialized failed. database:" + db.getFullName() + " not exist");
+        }
+        try {
+            Table table = db.getTable(tableName);
+            if (table == null) {
+                throw new DdlException("create materialized failed. table:" + tableName + " not exist");
+            }
+            if (table.isCloudNativeTable()) {
+                throw new DdlException("Creating synchronous materialized view(rollup) is not supported in " +
+                        "shared data clusters.\nPlease use asynchronous materialized view instead.\n" +
+                        "Refer to https://docs.starrocks.io/en-us/latest/sql-reference/sql-statements" +
+                        "/data-definition/CREATE%20MATERIALIZED%20VIEW#asynchronous-materialized-view for details.");
+            }
+            if (!table.isOlapTable()) {
+                throw new DdlException("Do not support create synchronous materialized view(rollup) on " +
+                        table.getType().name() + " table[" + tableName + "]");
+            }
+            OlapTable olapTable = (OlapTable) table;
+            if (olapTable.getKeysType() == KeysType.PRIMARY_KEYS) {
+                throw new DdlException(
+                        "Do not support create materialized view on primary key table[" + tableName + "]");
+            }
+            if (GlobalStateMgr.getCurrentState().getInsertOverwriteJobMgr().hasRunningOverwriteJob(olapTable.getId())) {
+                throw new DdlException("Table[" + olapTable.getName() + "] is doing insert overwrite job, " +
+                        "please start to create materialized view after insert overwrite");
+            }
+            olapTable.checkStableAndNormal();
+
+            materializedViewHandler.processCreateMaterializedView(stmt, db, olapTable);
+        } finally {
+            locker.unLockDatabase(db, LockType.WRITE);
+        }
     }
 
     // TODO(murphy) refactor it into MVManager
@@ -3218,6 +3279,7 @@ public class LocalMetastore implements ConnectorMetadata, MVRepairHandler {
         // set viewDefineSql
         materializedView.setViewDefineSql(stmt.getInlineViewDef());
         materializedView.setSimpleDefineSql(stmt.getSimpleViewDef());
+        materializedView.setOriginalViewDefineSql(stmt.getOriginalViewDefineSql());
         // set partitionRefTableExprs
         if (stmt.getPartitionRefTableExpr() != null) {
             //avoid to get a list of null inside
@@ -4138,6 +4200,23 @@ public class LocalMetastore implements ConnectorMetadata, MVRepairHandler {
         GlobalStateMgr.getCurrentState().getEditLog().logModifyBucketSize(info);
     }
 
+    public void modifyTableMutableBucketNum(Database db, OlapTable table, Map<String, String> properties) {
+        Locker locker = new Locker();
+        Preconditions.checkArgument(locker.isDbWriteLockHeldByCurrentThread(db));
+        TableProperty tableProperty = table.getTableProperty();
+        if (tableProperty == null) {
+            tableProperty = new TableProperty(properties);
+            table.setTableProperty(tableProperty);
+        } else {
+            tableProperty.modifyTableProperties(properties);
+        }
+        tableProperty.buildMutableBucketNum();
+
+        ModifyTablePropertyOperationLog info = new ModifyTablePropertyOperationLog(db.getId(), table.getId(),
+                properties);
+        GlobalStateMgr.getCurrentState().getEditLog().logModifyMutableBucketNum(info);
+    }
+
     public void modifyTablePrimaryIndexCacheExpireSec(Database db, OlapTable table, Map<String, String> properties) {
         Locker locker = new Locker();
         Preconditions.checkArgument(locker.isDbWriteLockHeldByCurrentThread(db));
@@ -4167,6 +4246,8 @@ public class LocalMetastore implements ConnectorMetadata, MVRepairHandler {
             modifyTableReplicatedStorage(db, table, properties);
         } else if (metaType == TTabletMetaType.BUCKET_SIZE) {
             modifyTableAutomaticBucketSize(db, table, properties);
+        } else if (metaType == TTabletMetaType.MUTABLE_BUCKET_NUM) {
+            modifyTableMutableBucketNum(db, table, properties);
         } else if (metaType == TTabletMetaType.PRIMARY_INDEX_CACHE_EXPIRE_SEC) {
             modifyTablePrimaryIndexCacheExpireSec(db, table, properties);
         }
